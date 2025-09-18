@@ -121,43 +121,66 @@ PALETTE = np.array([
 ], dtype=np.uint8)
 
 
+def rgb_to_hsv_np(rgb):
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    maxc = np.max(rgb, axis=-1)
+    minc = np.min(rgb, axis=-1)
+    v = maxc
+    delta = maxc - minc
+
+    s = np.zeros_like(maxc)
+    s[maxc != 0] = delta[maxc != 0] / maxc[maxc != 0]
+
+    h = np.zeros_like(maxc)
+    mask = delta != 0
+    idx = (maxc == r) & mask
+    h[idx] = ((g[idx] - b[idx]) / delta[idx]) % 6
+    idx = (maxc == g) & mask
+    h[idx] = ((b[idx] - r[idx]) / delta[idx]) + 2
+    idx = (maxc == b) & mask
+    h[idx] = ((r[idx] - g[idx]) / delta[idx]) + 4
+    h = h / 6.0
+    return np.stack([h, s, v], axis=-1)
+
 def quantize_to_palette(img: Image.Image) -> Image.Image:
-    arr = np.array(img.convert("RGB"), dtype=np.uint8)
+    # Convert to array [0,1]
+    arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
     h, w, _ = arr.shape
 
-    # Output initialized to white
-    result = np.full_like(arr, (255, 255, 255))
+    hsv = rgb_to_hsv_np(arr)
+    H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
 
-    # Normalize to [0,1] for HSV conversion
-    arr_norm = arr / 255.0
+    # Palette (RGB 0–1)
+    palette_rgb = np.array([
+        [0, 0, 0],   # black
+        [1, 1, 1],   # white
+        [1, 0, 0],   # red
+        [1, 1, 0],   # yellow
+    ], dtype=np.float32)
 
-    # Compute HSV for all pixels
-    hsv = np.zeros_like(arr_norm)
-    for y in range(h):
-        for x in range(w):
-            r, g, b = arr_norm[y, x]
-            hsv[y, x] = colorsys.rgb_to_hsv(r, g, b)  # (hue 0-1, sat 0-1, val 0-1)
+    # Start with -1 (unassigned)
+    nearest = np.full((h, w), -1, dtype=np.int32)
 
-    H = hsv[:, :, 0] * 360  # hue in degrees
-    S = hsv[:, :, 1]
-    V = hsv[:, :, 2]
+    # --- Rule-based overrides ---
+    # White: low saturation, high brightness
+    mask_white = (S < 0.25) & (V > 0.75)
+    nearest[mask_white] = 1
 
-    # --- White: low saturation + high brightness ---
-    mask_white = (S < 0.2) & (V > 0.85)
-    result[mask_white] = (255, 255, 255)
+    # Yellow: hue in [35–75 deg] and reasonably saturated
+    mask_yellow = (H >= 35/360.0) & (H <= 75/360.0) & (S > 0.3) & (V > 0.25)
+    nearest[mask_yellow] = 3
 
-    # --- Black: low brightness ---
-    mask_black = V < 0.25
-    result[mask_black] = (0, 0, 0)
+    # --- Fallback: nearest in RGB ---
+    unassigned = nearest == -1
+    pixels = arr[unassigned].reshape(-1, 3)
 
-    # --- Red: hue near 0° or 360°, strong saturation ---
-    mask_red = ((H < 20) | (H > 340)) & (S > 0.5) & (V > 0.25)
-    result[mask_red] = (255, 0, 0)
+    if pixels.size > 0:
+        dist = np.sum((pixels[:, None, :] - palette_rgb[None, :, :]) ** 2, axis=-1)
+        nearest_vals = np.argmin(dist, axis=1)
+        nearest[unassigned] = nearest_vals
 
-    # --- Yellow: hue ~40–65°, strong saturation ---
-    mask_yellow = (H >= 40) & (H <= 65) & (S > 0.5) & (V > 0.25)
-    result[mask_yellow] = (255, 255, 0)
-
+    # Map back to RGB
+    result = (palette_rgb[nearest] * 255).astype(np.uint8)
     return Image.fromarray(result)
 
 
@@ -311,7 +334,6 @@ def _choose_image(quote: str, image_urls: List[str]) -> str:
                         "type": "text",
                         "text": (
                             f"Your task is to select the single best image from the list. The chosen image should be the clearest and best represent the quote: {quote}."
-                            "  - Prefer images that look great in only for color (black, white, red, yellow)."
                             "  - Prefer images that include the quote text, but only if the text is clear and accurately matches the quote."
                             "  - If no image with the quote meets these conditions, choose the clearest image that visually represents the quote instead."
                             "  - Return only the number of the selected image, with no additional text or explanation."
