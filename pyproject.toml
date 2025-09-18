@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cat-of-the-day"
+version = "0.1.0"
+description = "Minimalist cat-of-the-day poster generator"
+requires-python = ">=3.10"
+authors = [{ name = "@UTBDK" }]
+readme = "README.md"
+dependencies = [
+  "requests>=2.31.0",
+  "Pillow>=10.0.0",
+  "numpy>=1.25.0",
+  "boto3>=1.28.0",
+]
+
+[project.scripts]
+cat-of-the-day = "gen:main"
+
+[tool.setuptools]
+py-modules = ["gen"]
