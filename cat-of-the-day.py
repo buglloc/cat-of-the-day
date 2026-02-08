@@ -2,6 +2,7 @@ import requests
 import json
 import os
 import sys
+import re
 import logging
 import base64
 import colorsys
@@ -34,7 +35,7 @@ def _proxy_base_url() -> str:
 
 
 def _chat_url() -> str:
-    return f"{_proxy_base_url()}/openai/v1/chat/completions"
+    return f"{_proxy_base_url()}/openrouter/v1/chat/completions"
 
 
 def _ideogram_url() -> str:
@@ -56,10 +57,7 @@ Replace `<QUOTE OF THE DAY>` in the poster prompt with the generated quote.
 
 **Output format:**
 Return strictly in JSON:
-
-```
 {"quote": "<quote>", "prompt": "<poster prompt with the quote inserted>"}
-```
 
 ---
 
@@ -120,6 +118,10 @@ PALETTE = np.array([
     [255, 0, 0],      # red
 ], dtype=np.uint8)
 
+
+def parse_json_md(text):
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    return json.loads(text.strip("\r\n`"))
 
 def rgb_to_hsv_np(rgb):
     r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
@@ -279,7 +281,7 @@ def _download_file(url: str, dest_path: str | Path, chunk_size: int = 8192) -> N
 
 def _gen_prompt() -> Tuple[str, str]:
     chat_payload = {
-        "model": "gpt-5",
+        "model": "google/gemini-2.5-pro-preview-03-25",
         "messages": [
             {
                 "role": "system",
@@ -303,13 +305,15 @@ def _gen_prompt() -> Tuple[str, str]:
         json=chat_payload,
         timeout=DEFAULT_TIMEOUT_SEC,
     )
-    chat_resp.raise_for_status()
-    chat_data = chat_resp.json()
 
+    if chat_resp.status_code >= 400:
+        raise RuntimeError(f"API error {chat_resp.status_code}: {chat_resp.text}")
+
+    chat_data = chat_resp.json()
     try:
         logger.info("Parsing Chat response JSON...")
-        message_content = chat_data["response"]["choices"][0]["message"]["content"].strip()
-        parsed = json.loads(message_content)
+        message_content = chat_data["response"]["choices"][0]["message"]["content"]
+        parsed = parse_json_md(message_content)
         quote = parsed["quote"]
         prompt = parsed["prompt"]
     except (KeyError, IndexError, json.JSONDecodeError) as e:
@@ -321,7 +325,7 @@ def _gen_prompt() -> Tuple[str, str]:
 
 def _choose_image(quote: str, image_urls: List[str]) -> str:
     chat_payload = {
-        "model": "gpt-5",
+        "model": "google/gemini-2.5-pro-preview-03-25",
         "messages": [
             {
                 "role": "system",
