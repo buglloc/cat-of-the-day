@@ -27,7 +27,7 @@ wifi:
 
 http_request:
   id: fetch_image_request
-  timeout: 5s
+  timeout: 30s
 
 online_image:
   - id: poster_img
