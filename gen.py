@@ -1,11 +1,12 @@
+import base64
 import json
 import logging
 import os
-import re
 import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 import boto3
 import numpy as np
@@ -18,9 +19,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-AI_PROXY_TOKEN = os.environ.get("AI_PROXY_TOKEN")
-AI_PROXY_BASE_URL = os.environ.get("AI_PROXY_BASE_URL")
-MODEL_ID = os.environ.get("MODEL_ID", "google/gemini-2.5-pro-preview-03-25")
+LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY")
+LITELLM_BASE_URL = os.environ.get("LITELLM_BASE_URL", "https://llm.ive.buglloc.cc")
+PROMPT_MODEL_ID = os.environ.get("PROMPT_MODEL_ID", "gpt-5-mini")
+PROMPT_PROVIDER = os.environ.get("PROMPT_PROVIDER", "openai")
+SELECTION_MODEL_ID = os.environ.get("SELECTION_MODEL_ID", "qwen/qwen3-vl-32b-instruct")
+SELECTION_PROVIDER = os.environ.get("SELECTION_PROVIDER", "openrouter")
+IMAGE_MODEL_ID = os.environ.get("IMAGE_MODEL_ID", "gpt-image-1-mini")
 
 S3_BUCKET = os.environ.get("S3_BUCKET")
 S3_REGION = os.environ.get("S3_REGION")
@@ -33,62 +38,106 @@ TARGET_SIZE = (800, 480)
 LLM_RETRIES = 3
 NUM_CANDIDATES = 3
 
-SYSTEM_PROMPT = (
-    "You are an award-winning art director and poster designer. "
-    "You create striking, original poster concepts that grab attention, "
-    "communicate a clear message, and match the brief precisely."
-)
+CONCEPT_SYSTEM_PROMPT = """You are a sharp editorial art director.
+Turn one dry, original observation into a simple visual joke that is immediately
+readable in a four-color minimalist cat poster. Follow every output constraint."""
 
-QUOTE_AND_PROMPT_INSTRUCTION = """Generate one new English quote in the spirit of minimalist, ironic, slightly philosophical sayings, then adapt the poster prompt to match the quote's mood.
+CONCEPT_INSTRUCTION = """Create one original English quote and its poster composition.
 
-Quote rules:
-- English only.
-- 1 sentence, maximum 2.
-- Must fit on a single line of monospaced typography at the bottom of an 800x480 poster — keep it under 60 characters total.
-- Humor, irony, minimalism, with a small unexpected twist or reversal.
-- Use straight ASCII quotes only inside the JSON value. No emojis, smilies, or extra symbols.
-
-Poster prompt rules:
-Use this base template. Substitute `<COMPOSITION>` with a single concrete sentence describing the visual scene that matches the quote, and `<QUOTE OF THE DAY>` with the generated quote.
-
-```
-Minimalist wireframe brush-pen style poster of a lone cat.
-Clean, bold silkscreen aesthetic with EXACTLY four solid flat colors:
-- pure yellow (background)
-- pure red (small accents)
-- pure black (silhouettes)
-- pure white
-
-Strict rules:
-- Background must be entirely pure yellow.
-- Absolutely NO frames, borders, rectangles, textures, or extra layers.
-- Red is ONLY for small accent scratches, details, or marks.
-- No gradients, shading, halftone patterns, outlines, or extra colors.
-- Must look like a flat silkscreen print or bold brush-pen artwork.
-- The cat is black and white only.
+Quote:
+- One sentence and at most 55 characters; 60 is a hard limit.
+- Use printable ASCII only. Write "I'm", never "I’m"; use a hyphen, never an
+  en dash or em dash. Count every character, including spaces and punctuation.
+- Dry, concise, slightly philosophical humor with an unexpected turn.
+- It must sound natural, not like an inspirational slogan.
+- Avoid cat puns, famous quotations, idioms, emojis, hashtags, quotation marks,
+  and references to Mondays, nine lives, boxes, curiosity, or "if I fits".
+- Return the quote without surrounding quotation marks.
 
 Composition:
-- <COMPOSITION>
+- One concrete sentence describing a single cat-centered visual scene.
+- Make the quote's twist visible through the cat's pose, action, scale, and at
+  most one simple prop. Prefer a bold silhouette over tiny details.
+- The cat must dominate a landscape frame with a clear area along the bottom
+  for the quote.
+- Do not mention text, typography, colors, style, mood, or camera instructions.
 
-Scale and framing:
-- The cat dominates the composition and fills most of the frame.
-- Full bleed, edge-to-edge design, with minimal unused background.
+Return only the requested JSON object."""
+
+POSTER_PROMPT_TEMPLATE = """Minimalist brush-pen poster of a lone cat, composed for a 1152x704 landscape canvas.
+
+Visual idea:
+- {composition}
+
+Graphic treatment:
+- Bold, expressive black brush shapes with sparse white cutouts.
+- EXACTLY four solid flat colors: pure yellow background, pure black and pure
+  white cat, and pure red used only for one or two small accent marks.
+- Flat silkscreen print: hard edges, high contrast, no gradients, shading,
+  shadows, halftones, textures, transparency, or extra colors.
+- Full bleed with no frame, border, panel, rectangle, watermark, signature, or
+  decorative background elements.
+- The cat is the unmistakable focal point and fills most of the frame.
 
 Typography:
-- At the very bottom of the composition, render EXACTLY this quote as bold monospaced lettering on a single line:
-"<QUOTE OF THE DAY>"
-- The text is part of the artwork (not metadata), spans the full width as a clean strip, horizontally aligned, clearly visible, and never overlaps the cat.
+- Reserve a clean, unobstructed strip at the very bottom.
+- In that strip render EXACTLY this text, once, on one line:
+  "{quote}"
+- Bold black monospaced uppercase lettering, centered and fully legible.
+- Preserve every character and word exactly. No other letters or words.
+- The lettering must not overlap the cat or touch the canvas edges.
 
-Atmosphere: sharp minimalism, bold irony, humor.
-```
+Overall effect: immediate visual joke, sharp minimalism, confident handmade energy."""
 
-Output:
-Return ONLY a raw JSON object, no markdown fences, no commentary:
-{"quote": "<quote>", "prompt": "<full poster prompt with substitutions applied>"}
-"""
+CONCEPT_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "poster_concept",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "quote": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 60,
+                    "pattern": r"^[\x20-\x21\x23-\x7e]+$",
+                },
+                "composition": {"type": "string"},
+            },
+            "required": ["quote", "composition"],
+            "additionalProperties": False,
+        },
+    },
+}
 
-JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+SELECTION_SYSTEM_PROMPT = """You are a meticulous poster proofreader and art director.
+Compare every candidate against the supplied quote and rubric. Inspect the
+actual image rather than trusting its order."""
 
+SELECTION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "image_selection",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {"index": {"type": "integer"}},
+            "required": ["index"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+ASCII_PUNCTUATION_TRANSLATION = str.maketrans({
+    "\N{LEFT SINGLE QUOTATION MARK}": "'",
+    "\N{RIGHT SINGLE QUOTATION MARK}": "'",
+    "\N{EN DASH}": "-",
+    "\N{EM DASH}": "-",
+    "\N{HORIZONTAL ELLIPSIS}": "...",
+    "\N{NO-BREAK SPACE}": " ",
+})
 
 def _require_env(value: str | None, name: str) -> str:
     if not value:
@@ -96,44 +145,90 @@ def _require_env(value: str | None, name: str) -> str:
     return value
 
 
-def _proxy_base_url() -> str:
-    return _require_env(AI_PROXY_BASE_URL, "AI_PROXY_BASE_URL").rstrip("/")
+def _litellm_root_url() -> str:
+    return LITELLM_BASE_URL.rstrip("/").removesuffix("/v1")
 
 
-def _chat_url() -> str:
-    return f"{_proxy_base_url()}/openrouter/v1/chat/completions"
+def _chat_url(provider: str) -> str:
+    if provider not in {"openai", "openrouter"}:
+        raise ValueError(f"Unsupported chat provider: {provider}")
+    return f"{_litellm_root_url()}/{provider}/v1/chat/completions"
 
 
-def _ideogram_url() -> str:
-    return f"{_proxy_base_url()}/ideogram/v1/ideogram-v3/generate"
+def _image_generation_url() -> str:
+    return f"{_litellm_root_url()}/openai/v1/images/generations"
 
 
-def _parse_json_object(text: str) -> dict:
-    match = JSON_OBJECT_RE.search(text)
-    if not match:
-        raise ValueError(f"No JSON object in response: {text!r}")
-    return json.loads(match.group(0))
+def _parse_json_object(text: str) -> dict[str, Any]:
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Expected a JSON object, got: {text!r}")
+    return parsed
 
 
-def _chat(messages: list[dict], model: str | None = None) -> str:
-    payload = {"model": model or MODEL_ID, "messages": messages}
-    token = _require_env(AI_PROXY_TOKEN, "AI_PROXY_TOKEN")
+def _chat(
+    messages: list[dict[str, Any]],
+    *,
+    model: str,
+    provider: str,
+    response_format: dict[str, Any],
+    temperature: float,
+    max_completion_tokens: int,
+    reasoning_effort: str | None = None,
+) -> str:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "response_format": response_format,
+        "temperature": temperature,
+        "max_completion_tokens": max_completion_tokens,
+    }
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
+
+    headers = {"Content-Type": "application/json"}
+    if LITELLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LITELLM_API_KEY}"
+
     resp = requests.post(
-        _chat_url(),
-        headers={
-            "Authorization": f"OAuth {token}",
-            "Content-Type": "application/json",
-        },
+        _chat_url(provider),
+        headers=headers,
         json=payload,
         timeout=DEFAULT_TIMEOUT_SEC,
     )
     if resp.status_code >= 400:
-        raise RuntimeError(f"Chat API error {resp.status_code}: {resp.text}")
+        raise RuntimeError(f"LiteLLM error {resp.status_code}: {resp.text}")
     data = resp.json()
     try:
-        return data["response"]["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as e:
-        raise ValueError(f"Unexpected chat response shape: {json.dumps(data)}") from e
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise ValueError(f"Unexpected LiteLLM response: {json.dumps(data)}") from e
+    if not isinstance(content, str):
+        raise ValueError(f"LiteLLM returned non-text content: {content!r}")
+    return content
+
+
+def _parse_concept(content: str) -> tuple[str, str]:
+    parsed = _parse_json_object(content)
+    quote = parsed["quote"]
+    composition = parsed["composition"]
+    if not isinstance(quote, str) or not isinstance(composition, str):
+        raise ValueError("Quote and composition must be strings")
+    quote = quote.translate(ASCII_PUNCTUATION_TRANSLATION).strip()
+    composition = composition.strip()
+    if not quote or not composition:
+        raise ValueError("Quote and composition must not be empty")
+    if not quote.isascii() or "\n" in quote or len(quote) > 60:
+        raise ValueError(f"Quote violates the single-line ASCII limit: {quote!r}")
+    if '"' in quote:
+        raise ValueError(f"Quote must not contain quotation marks: {quote!r}")
+    if "\n" in composition:
+        raise ValueError(f"Composition must be one line: {composition!r}")
+    return quote, composition
+
+
+def _build_poster_prompt(quote: str, composition: str) -> str:
+    return POSTER_PROMPT_TEMPLATE.format(quote=quote, composition=composition)
 
 
 def _gen_prompt() -> tuple[str, str]:
@@ -141,85 +236,138 @@ def _gen_prompt() -> tuple[str, str]:
     for attempt in range(1, LLM_RETRIES + 1):
         logger.info("Generating quote and prompt (attempt %d/%d)...", attempt, LLM_RETRIES)
         try:
-            content = _chat([
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": QUOTE_AND_PROMPT_INSTRUCTION},
-            ])
-            parsed = _parse_json_object(content)
-            quote = parsed["quote"].strip()
-            prompt = parsed["prompt"].strip()
+            content = _chat(
+                [
+                    {"role": "system", "content": CONCEPT_SYSTEM_PROMPT},
+                    {"role": "user", "content": CONCEPT_INSTRUCTION},
+                ],
+                model=PROMPT_MODEL_ID,
+                provider=PROMPT_PROVIDER,
+                response_format=CONCEPT_RESPONSE_FORMAT,
+                temperature=1.0,
+                max_completion_tokens=500,
+                reasoning_effort="minimal",
+            )
+            quote, composition = _parse_concept(content)
             logger.info("Generated quote: %s", quote)
-            return quote, prompt
-        except (ValueError, KeyError, json.JSONDecodeError) as e:
+            return quote, _build_poster_prompt(quote, composition)
+        except (requests.RequestException, RuntimeError, ValueError, KeyError) as e:
             last_err = e
             logger.warning("Attempt %d failed: %s", attempt, e)
             time.sleep(2 ** (attempt - 1))
     raise RuntimeError(f"Failed to generate quote+prompt after {LLM_RETRIES} attempts") from last_err
 
 
-def _gen_image_urls(prompt: str, num_images: int = NUM_CANDIDATES) -> list[str]:
-    form = {
-        "prompt": (None, prompt),
-        "resolution": (None, "1152x704"),
-        "rendering_speed": (None, "DEFAULT"),
-        "num_images": (None, str(num_images)),
+def _image_data_url(encoded: str) -> str:
+    if encoded.startswith("UklGR"):
+        media_type = "image/webp"
+    elif encoded.startswith("iVBOR"):
+        media_type = "image/png"
+    elif encoded.startswith("/9j/"):
+        media_type = "image/jpeg"
+    else:
+        raise ValueError("Unknown image format returned by OpenAI")
+    return f"data:{media_type};base64,{encoded}"
+
+
+def _gen_image_sources(prompt: str, num_images: int = NUM_CANDIDATES) -> list[str]:
+    payload = {
+        "model": IMAGE_MODEL_ID,
+        "prompt": prompt,
+        "n": num_images,
+        "size": "1536x1024",
+        "quality": "medium",
+        "background": "opaque",
+        "output_format": "webp",
+        "output_compression": 90,
     }
-    logger.info("Generating %d candidate images via Ideogram...", num_images)
-    token = _require_env(AI_PROXY_TOKEN, "AI_PROXY_TOKEN")
+    logger.info(
+        "Generating %d candidate images with %s...",
+        num_images,
+        IMAGE_MODEL_ID,
+    )
+    headers = {"Content-Type": "application/json"}
+    if LITELLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LITELLM_API_KEY}"
     resp = requests.post(
-        _ideogram_url(),
-        headers={"Authorization": f"OAuth {token}"},
-        files=form,
+        _image_generation_url(),
+        headers=headers,
+        json=payload,
         timeout=DEFAULT_TIMEOUT_SEC,
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        raise RuntimeError(f"OpenAI Images error {resp.status_code}: {resp.text}")
+
     data = resp.json()
     try:
-        return [item["url"] for item in data["response"]["data"]]
-    except (KeyError, TypeError) as e:
-        raise RuntimeError(f"Unexpected Ideogram response: {json.dumps(data)}") from e
+        items = data["data"]
+        sources = [
+            item["url"] if item.get("url") else _image_data_url(item["b64_json"])
+            for item in items
+        ]
+    except (KeyError, TypeError, ValueError) as e:
+        raise RuntimeError(f"Unexpected OpenAI Images response: {json.dumps(data)}") from e
+    if len(sources) != num_images:
+        raise RuntimeError(f"OpenAI returned {len(sources)} of {num_images} requested images")
+    return sources
 
 
-def _choose_image(quote: str, image_urls: list[str]) -> str:
-    if len(image_urls) == 1:
-        return image_urls[0]
+def _choose_image(quote: str, image_sources: list[str]) -> str:
+    if len(image_sources) == 1:
+        return image_sources[0]
 
-    valid_indices = ", ".join(str(i) for i in range(len(image_urls)))
-    user_content: list[dict] = [{
+    user_content: list[dict[str, Any]] = [{
         "type": "text",
         "text": (
-            f'Select the single best image for this quote: "{quote}".\n'
-            "Prefer images where the quote text is rendered clearly and accurately, "
-            "with no spelling errors or text artifacts. Otherwise pick the image that "
-            "most clearly represents the quote visually.\n"
-            f"Respond with ONLY a single digit from this set: {valid_indices} "
-            "(zero-indexed, in the order the images were given). No words, no punctuation."
+            f'The intended quote is exactly: "{quote}"\n\n'
+            "Choose the strongest finished poster. Rank these requirements in order:\n"
+            "1. The intended quote appears exactly once, with identical spelling and "
+            "punctuation, and no other text or text-like artifacts.\n"
+            "2. The quote is fully legible on one unobstructed line at the bottom, "
+            "not cropped and not overlapping the cat.\n"
+            "3. The image uses only a yellow background, a black-and-white cat, and "
+            "small red accents; it has no border, gradients, shading, or texture.\n"
+            "4. The cat dominates the frame and the visual joke clearly supports the quote.\n"
+            "Reject a pretty image when another candidate follows the typography more exactly. "
+            f"Return the zero-based index from 0 through {len(image_sources) - 1}."
         ),
     }]
-    for url in image_urls:
-        user_content.append({"type": "image_url", "image_url": {"url": url}})
+    for source in image_sources:
+        user_content.append({
+            "type": "image_url",
+            "image_url": {"url": source, "detail": "high"},
+        })
 
     try:
-        logger.info("Asking model to pick the best image...")
-        content = _chat([
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ]).strip()
-        match = re.search(r"\d+", content)
-        if not match:
-            raise ValueError(f"No digit in response: {content!r}")
-        idx = int(match.group(0))
-        if not 0 <= idx < len(image_urls):
-            raise ValueError(f"Index {idx} out of range")
+        logger.info("Asking %s to pick the best image...", SELECTION_MODEL_ID)
+        content = _chat(
+            [
+                {"role": "system", "content": SELECTION_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            model=SELECTION_MODEL_ID,
+            provider=SELECTION_PROVIDER,
+            response_format=SELECTION_RESPONSE_FORMAT,
+            temperature=0.0,
+            max_completion_tokens=32,
+        )
+        idx = _parse_json_object(content)["index"]
+        if type(idx) is not int or not 0 <= idx < len(image_sources):
+            raise ValueError(f"Index {idx!r} out of range")
         logger.info("Model picked image #%d", idx)
-        return image_urls[idx]
-    except Exception as e:
+        return image_sources[idx]
+    except (requests.RequestException, RuntimeError, ValueError, KeyError) as e:
         logger.warning("Image selection failed (%s); falling back to first image", e)
-        return image_urls[0]
+        return image_sources[0]
 
 
-def _download_file(url: str, dest: str | Path, chunk_size: int = 8192) -> None:
-    with requests.get(url, stream=True, timeout=DEFAULT_TIMEOUT_SEC) as r:
+def _download_file(source: str, dest: str | Path, chunk_size: int = 8192) -> None:
+    if source.startswith("data:"):
+        _, encoded = source.split(",", 1)
+        Path(dest).write_bytes(base64.b64decode(encoded, validate=True))
+        return
+
+    with requests.get(source, stream=True, timeout=DEFAULT_TIMEOUT_SEC) as r:
         r.raise_for_status()
         with open(dest, "wb") as out:
             for chunk in r.iter_content(chunk_size=chunk_size):
@@ -320,16 +468,16 @@ def upload_file_to_s3(local_path: str | Path, bucket: str, key: str, content_typ
 def main() -> None:
     _check_s3_env()
 
-    quote, ideogram_prompt = _gen_prompt()
-    image_urls = _gen_image_urls(ideogram_prompt)
-    image_url = _choose_image(quote, image_urls)
+    quote, image_prompt = _gen_prompt()
+    image_sources = _gen_image_sources(image_prompt)
+    image_source = _choose_image(quote, image_sources)
 
     with tempfile.TemporaryDirectory(prefix="cat-of-the-day-") as tmpdir:
-        original_path = Path(tmpdir) / "original.png"
+        original_path = Path(tmpdir) / "original.webp"
         poster_path = Path(tmpdir) / "poster.bmp"
 
-        logger.info("Downloading chosen image: %s", image_url)
-        _download_file(image_url, original_path)
+        logger.info("Saving chosen image...")
+        _download_file(image_source, original_path)
 
         logger.info("Postprocessing into 4-color BMP...")
         process_image(original_path, poster_path)
@@ -338,7 +486,12 @@ def main() -> None:
         if S3_BUCKET:
             url = upload_file_to_s3(poster_path, S3_BUCKET, "poster.bmp", content_type="image/bmp")
             logger.info("Uploaded poster: %s", url)
-            orig_url = upload_file_to_s3(original_path, S3_BUCKET, "original_poster.png", content_type="image/png")
+            orig_url = upload_file_to_s3(
+                original_path,
+                S3_BUCKET,
+                "original_poster.webp",
+                content_type="image/webp",
+            )
             logger.info("Uploaded original: %s", orig_url)
         else:
             sys.stdout.buffer.write(poster_path.read_bytes())
